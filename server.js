@@ -119,8 +119,12 @@ const io = new Server(server, {
 
 // Middleware
 app.use(cors({
-  origin: ['http://localhost:5173', 'https://realtime-chat-app-navy-ten.vercel.app'],
-  credentials: true
+  origin: [
+    'http://localhost:5173',
+    'https://realtime-chat-app-navy-ten.vercel.app'
+  ],
+  credentials: true, // This is important!
+  exposedHeaders: ['set-cookie'] // May help with some browsers
 }));
 app.use(express.json());
 app.use(cookieParser());
@@ -290,11 +294,11 @@ app.post('/login', async (req, res) => {
     await user.save();
 
     const token = signToken({ userId: user.id });
-    res.cookie(COOKIE_NAME, token, {
+    res.cookie('token', token, {
       httpOnly: true,
-      sameSite: 'lax',
-      secure: false,
-      maxAge: 7 * 24 * 60 * 60 * 1000
+      secure: true, // REQUIRED for SameSite=None
+      sameSite: 'none', // Allows cross-site cookies
+      maxAge: 7 * 24 * 60 * 60 * 1000 // 7 days
     });
     res.json({ ok: true });
   } catch (err) {
@@ -726,45 +730,45 @@ io.on('connection', async (socket) => {
     }
   });
 
-socket.on('message:send', async ({ to, text }) => {
-  try {
-    if (!to || !text) return;
+  socket.on('message:send', async ({ to, text }) => {
+    try {
+      if (!to || !text) return;
 
-    const otherUser = await User.findOne({ id: to });
-    if (!otherUser) return;
+      const otherUser = await User.findOne({ id: to });
+      if (!otherUser) return;
 
-    // Get or create chat room for these two users
-    const room = await getOrCreateChatRoom(userId, to);
+      // Get or create chat room for these two users
+      const room = await getOrCreateChatRoom(userId, to);
 
-    const msg = new Message({
-      id: uuid(),
-      roomId: room.id,
-      from: userId,
-      to,
-      text,
-      createdAt: Date.now(),
-      updatedAt: Date.now()
-    });
+      const msg = new Message({
+        id: uuid(),
+        roomId: room.id,
+        from: userId,
+        to,
+        text,
+        createdAt: Date.now(),
+        updatedAt: Date.now()
+      });
 
-    await msg.save();
+      await msg.save();
 
-    // Update room's updatedAt timestamp
-    await ChatRoom.findOneAndUpdate(
-      { id: room.id },
-      { updatedAt: Date.now() }
-    );
+      // Update room's updatedAt timestamp
+      await ChatRoom.findOneAndUpdate(
+        { id: room.id },
+        { updatedAt: Date.now() }
+      );
 
-    // Send to both sender and receiver
-    io.to(userId).to(to).emit('message:new', msg);
+      // Send to both sender and receiver
+      io.to(userId).to(to).emit('message:new', msg);
 
-    // IMPORTANT: Notify both users to update their chat lists
-    io.to(userId).emit('chatlist:refresh');
-    io.to(to).emit('chatlist:refresh');
-    
-  } catch (err) {
-    console.error('Error sending message:', err);
-  }
-});
+      // IMPORTANT: Notify both users to update their chat lists
+      io.to(userId).emit('chatlist:refresh');
+      io.to(to).emit('chatlist:refresh');
+
+    } catch (err) {
+      console.error('Error sending message:', err);
+    }
+  });
 
   socket.on('message:edit', async ({ messageId, text }) => {
     try {
@@ -787,31 +791,31 @@ socket.on('message:send', async ({ to, text }) => {
     }
   });
 
-socket.on('message:delete', async ({ messageId }) => {
-  try {
-    if (!messageId) return;
+  socket.on('message:delete', async ({ messageId }) => {
+    try {
+      if (!messageId) return;
 
-    const message = await Message.findOne({ id: messageId });
-    if (!message) return;
+      const message = await Message.findOne({ id: messageId });
+      if (!message) return;
 
-    // Check if user owns this message
-    if (message.from !== userId) return;
+      // Check if user owns this message
+      if (message.from !== userId) return;
 
-    if (message.isDeleted) {
-      console.log('Message already deleted, ignoring request');
-      return;
+      if (message.isDeleted) {
+        console.log('Message already deleted, ignoring request');
+        return;
+      }
+
+      // Soft delete
+      message.isDeleted = true;
+      await message.save();
+
+      // This prevents the infinite loop
+      socket.to(message.from).to(message.to).emit('message:deleted', { id: messageId });
+    } catch (err) {
+      console.error('Error deleting message:', err);
     }
-
-    // Soft delete
-    message.isDeleted = true;
-    await message.save();
-
-    // This prevents the infinite loop
-    socket.to(message.from).to(message.to).emit('message:deleted', { id: messageId });
-  } catch (err) {
-    console.error('Error deleting message:', err);
-  }
-});
+  });
 
   socket.on('typing:start', ({ to }) => {
     // Notify the recipient that this user is typing
