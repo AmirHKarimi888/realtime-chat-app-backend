@@ -185,7 +185,7 @@ const onlineUsers = new Map(); // userId -> socketId
 // ---------------- Rate Limiting ----------------
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 50, // Increase from 5 to 50 requests per 15 minutes
+  max: 200, // Increase from 5 to 50 requests per 15 minutes
   message: { error: 'Too many authentication attempts, please try again later' }
 });
 
@@ -598,12 +598,14 @@ io.use((socket, next) => {
 
 io.on('connection', async (socket) => {
   const userId = socket.user.userId;
-  console.log('User connected', userId);
+  console.log('User connected', userId, 'Socket ID:', socket.id);
 
+  // Join user to their own room
   socket.join(userId);
 
   // Add user to online list
   onlineUsers.set(userId, socket.id);
+  console.log('Online users:', Array.from(onlineUsers.keys()));
 
   try {
     // Update user's last seen
@@ -611,6 +613,15 @@ io.on('connection', async (socket) => {
       { id: userId },
       { lastSeen: Date.now() }
     );
+
+    // Join user to all their chat rooms
+    const user = await User.findOne({ id: userId });
+    if (user && user.chatRooms.length > 0) {
+      user.chatRooms.forEach(roomId => {
+        socket.join(roomId);
+        console.log(`User ${userId} joined room ${roomId}`);
+      });
+    }
 
     // Broadcast that this user came online to ALL connected clients
     io.emit('user:online', userId);
@@ -621,6 +632,7 @@ io.on('connection', async (socket) => {
       onlineStatus[id] = true;
     });
     socket.emit('users:online-status', onlineStatus);
+
   } catch (err) {
     console.error('Error updating user status:', err);
   }
@@ -730,45 +742,70 @@ io.on('connection', async (socket) => {
     }
   });
 
-  socket.on('message:send', async ({ to, text }) => {
-    try {
-      if (!to || !text) return;
-
-      const otherUser = await User.findOne({ id: to });
-      if (!otherUser) return;
-
-      // Get or create chat room for these two users
-      const room = await getOrCreateChatRoom(userId, to);
-
-      const msg = new Message({
-        id: uuid(),
-        roomId: room.id,
-        from: userId,
-        to,
-        text,
-        createdAt: Date.now(),
-        updatedAt: Date.now()
-      });
-
-      await msg.save();
-
-      // Update room's updatedAt timestamp
-      await ChatRoom.findOneAndUpdate(
-        { id: room.id },
-        { updatedAt: Date.now() }
-      );
-
-      // Send to both sender and receiver
-      io.to(userId).to(to).emit('message:new', msg);
-
-      // IMPORTANT: Notify both users to update their chat lists
-      io.to(userId).emit('chatlist:refresh');
-      io.to(to).emit('chatlist:refresh');
-
-    } catch (err) {
-      console.error('Error sending message:', err);
+socket.on('message:send', async ({ to, text }) => {
+  try {
+    if (!to || !text) {
+      console.log('Missing to or text parameters');
+      return socket.emit('error', { message: 'Missing parameters' });
     }
-  });
+
+    console.log(`User ${userId} sending message to ${to}: ${text}`);
+
+    const otherUser = await User.findOne({ id: to });
+    if (!otherUser) {
+      console.log(`Recipient ${to} not found`);
+      return socket.emit('error', { message: 'Recipient not found' });
+    }
+
+    // Get or create chat room for these two users
+    const room = await getOrCreateChatRoom(userId, to);
+    console.log(`Using room ${room.id} for users ${userId} and ${to}`);
+
+    // JOIN BOTH USERS TO THE ROOM
+    socket.join(room.id); // Sender joins the room
+    const recipientSocket = io.sockets.sockets.get(onlineUsers.get(to));
+    if (recipientSocket) {
+      recipientSocket.join(room.id); // Recipient joins the room
+    }
+
+    const msg = new Message({
+      id: uuid(),
+      roomId: room.id,
+      from: userId,
+      to,
+      text,
+      createdAt: Date.now(),
+      updatedAt: Date.now()
+    });
+
+    // Save the message to database
+    await msg.save();
+    console.log(`Message saved to database: ${msg.id}`);
+
+    // Update room's updatedAt timestamp
+    await ChatRoom.findOneAndUpdate(
+      { id: room.id },
+      { updatedAt: Date.now() }
+    );
+
+    // EMIT TO THE ROOM INSTEAD OF INDIVIDUAL USERS
+    io.to(room.id).emit('message:new', msg);
+    console.log(`Message emitted to room ${room.id}`);
+
+    // Notify both users to update their chat lists
+    io.to(userId).emit('chatlist:refresh');
+    io.to(to).emit('chatlist:refresh');
+
+    console.log(`Message ${msg.id} successfully processed`);
+
+  } catch (err) {
+    console.error('Error sending message:', err);
+    socket.emit('error', {
+      message: 'Failed to send message',
+      error: err.message
+    });
+  }
+});
 
   socket.on('message:edit', async ({ messageId, text }) => {
     try {
