@@ -20,16 +20,16 @@ const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/chat-a
 
 // Environment detection
 const isProduction = process.env.NODE_ENV === 'production';
-const FRONTEND_URL = isProduction
-  ? 'https://realtime-chat-app-navy-ten.vercel.app'
-  : 'http://localhost:5173';
+const allowedOrigins = [
+  'http://localhost:5173',
+  'https://realtime-chat-app-navy-ten.vercel.app'
+];
 
 // Enhanced cookie options for mobile compatibility
 const cookieOptions = {
   httpOnly: true,
   secure: isProduction,
   sameSite: isProduction ? 'none' : 'lax',
-  partitioned: isProduction,
   maxAge: 7 * 24 * 60 * 60 * 1000
 };
 
@@ -41,6 +41,14 @@ mongoose.connect(MONGODB_URI)
     process.exit(1);
   });
 
+mongoose.connection.on('disconnected', () => {
+  console.log('⚠️  MongoDB disconnected');
+});
+
+mongoose.connection.on('reconnected', () => {
+  console.log('✅ MongoDB reconnected');
+});
+
 // ---------------- Mongoose Schemas & Models ----------------
 const userSchema = new mongoose.Schema({
   id: { type: String, required: true, unique: true },
@@ -51,13 +59,6 @@ const userSchema = new mongoose.Schema({
   chatRooms: [{ type: String, ref: 'ChatRoom' }],
   createdAt: { type: Date, default: Date.now },
   lastSeen: { type: Date, default: Date.now }
-}, {
-  toJSON: {
-    transform: function (doc, ret) {
-      delete ret.password;
-      return ret;
-    }
-  }
 });
 
 const chatRoomSchema = new mongoose.Schema({
@@ -127,57 +128,49 @@ const upload = multer({
 const app = express();
 const server = http.createServer(app);
 
-// Enhanced CORS configuration for mobile
-const io = new Server(server, {
-  cors: {
-    origin: FRONTEND_URL,
-    credentials: true,
-    methods: ["GET", "POST"],
-    allowedHeaders: ["Content-Type", "Authorization", "Cookie"]
-  }
-});
-
-// Enhanced middleware setup
+// Enhanced CORS configuration - FIXED
 app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  
+  if (allowedOrigins.includes(origin)) {
+    res.header('Access-Control-Allow-Origin', origin);
+  }
+  
   res.header('Access-Control-Allow-Credentials', 'true');
   res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization, Cookie');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  
+  // Handle preflight requests
+  if (req.method === 'OPTIONS') {
+    return res.status(200).end();
+  }
+  
   next();
 });
 
-app.use(cors({
-  origin: FRONTEND_URL,
-  credentials: true,
-  exposedHeaders: ['set-cookie']
-}));
-
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json());
 app.use(cookieParser());
 app.use('/uploads', express.static(UPLOADS_DIR));
+
+// Socket.IO with proper CORS
+const io = new Server(server, {
+  cors: {
+    origin: allowedOrigins,
+    credentials: true,
+    methods: ["GET", "POST"]
+  }
+});
 
 // ---------------- Utilities ----------------
 const signToken = payload => jwt.sign(payload, SECRET, { expiresIn: '7d' });
 const auth = async (req, res, next) => {
+  const token = req.cookies[COOKIE_NAME];
+  if (!token) return res.status(401).json({ error: 'missing token' });
   try {
-    // Try to get token from cookies first
-    let token = req.cookies[COOKIE_NAME];
-
-    // If not in cookies, check Authorization header
-    if (!token && req.headers.authorization) {
-      const authHeader = req.headers.authorization;
-      if (authHeader.startsWith('Bearer ')) {
-        token = authHeader.substring(7);
-      }
-    }
-
-    if (!token) {
-      return res.status(401).json({ error: 'Authentication token required' });
-    }
-
     req.user = jwt.verify(token, SECRET);
     next();
-  } catch (error) {
-    console.error('Auth error:', error.message);
-    res.status(401).json({ error: 'Invalid or expired token' });
+  } catch {
+    res.status(401).json({ error: 'invalid token' });
   }
 };
 
@@ -193,13 +186,12 @@ const getOrCreateChatRoom = async (user1Id, user2Id) => {
       room = new ChatRoom({
         id: uuid(),
         participants: sortedUsers,
-        createdAt: new Date(),
-        updatedAt: new Date()
+        createdAt: Date.now(),
+        updatedAt: Date.now()
       });
 
       await room.save();
 
-      // Add room to both users' chatRooms array
       await User.updateMany(
         { id: { $in: sortedUsers } },
         { $addToSet: { chatRooms: room.id } }
@@ -219,24 +211,20 @@ const onlineUsers = new Map();
 // ---------------- Rate Limiting ----------------
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 100,
-  message: { error: 'Too many authentication attempts, please try again later' },
-  standardHeaders: true,
-  legacyHeaders: false,
+  max: 200,
+  message: { error: 'Too many authentication attempts, please try again later' }
 });
 
 const messageLimiter = rateLimit({
   windowMs: 60 * 1000,
-  max: 60,
-  message: { error: 'Too many messages, please try again later' },
-  standardHeaders: true,
-  legacyHeaders: false,
+  max: 30,
+  message: { error: 'Too many messages, please try again later' }
 });
 
 app.use('/users', authLimiter);
 app.use('/messages', messageLimiter);
 
-// ---------------- ORIGINAL ENDPOINTS (KEPT THE SAME) ----------------
+// ---------------- Routes ----------------
 app.post('/users', upload.single('avatar'), async (req, res) => {
   try {
     const { username, password, displayName, defaultAvatar } = req.body;
@@ -249,7 +237,7 @@ app.post('/users', upload.single('avatar'), async (req, res) => {
       return res.status(409).json({ error: 'username exists' });
 
     const userId = uuid();
-    const hashedPassword = await bcrypt.hash(password, 12);
+    const hashedPassword = await bcrypt.hash(password, 10);
 
     let avatarPath = '';
 
@@ -282,29 +270,23 @@ app.post('/users', upload.single('avatar'), async (req, res) => {
       defaultAvatar: defaultAvatar || '',
       avatar: avatarPath,
       chatRooms: [],
-      createdAt: new Date(),
-      lastSeen: new Date()
+      createdAt: Date.now(),
+      lastSeen: Date.now()
     });
 
     await user.save();
 
     const token = signToken({ userId: user.id });
-
-    // Set HTTP-only cookie
     res.cookie(COOKIE_NAME, token, cookieOptions);
 
-    // Also return token in response for mobile clients
     res.status(201).json({
       id: user.id,
       displayName: user.displayName,
       username: user.username,
       defaultAvatar: user.defaultAvatar,
-      avatar: user.avatar ? `/uploads/${user.avatar}` : null,
-      token: token // Include token in response for mobile
+      avatar: user.avatar ? `/uploads/${user.avatar}` : null
     });
   } catch (err) {
-    console.error('Registration error:', err);
-
     if (req.file) {
       try {
         await fsp.unlink(req.file.path);
@@ -312,7 +294,6 @@ app.post('/users', upload.single('avatar'), async (req, res) => {
         console.warn('Could not clean up uploaded file:', cleanupErr.message);
       }
     }
-
     res.status(500).json({ error: err.message });
   }
 });
@@ -326,21 +307,13 @@ app.post('/login', async (req, res) => {
     const match = await bcrypt.compare(password, user.password);
     if (!match) return res.status(401).json({ error: 'invalid credentials' });
 
-    user.lastSeen = new Date();
+    user.lastSeen = Date.now();
     await user.save();
 
     const token = signToken({ userId: user.id });
-
-    // Set HTTP-only cookie
     res.cookie(COOKIE_NAME, token, cookieOptions);
-
-    // Also return token in response for mobile
-    res.json({
-      ok: true,
-      token: token // Include token in response for mobile
-    });
+    res.json({ ok: true });
   } catch (err) {
-    console.error('Login error:', err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -349,19 +322,12 @@ app.post('/logout', auth, async (req, res) => {
   try {
     await User.findOneAndUpdate(
       { id: req.user.userId },
-      { lastSeen: new Date() }
+      { lastSeen: Date.now() }
     );
-
-    res.clearCookie(COOKIE_NAME, {
-      httpOnly: true,
-      secure: isProduction,
-      sameSite: isProduction ? 'none' : 'lax',
-      domain: isProduction ? '.vercel.app' : undefined
-    });
-
+    
+    res.clearCookie(COOKIE_NAME, cookieOptions);
     res.json({ ok: true });
   } catch (err) {
-    console.error('Logout error:', err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -371,7 +337,7 @@ app.get('/users/me', auth, async (req, res) => {
     const user = await User.findOne({ id: req.user.userId });
     if (!user) return res.status(404).json({ error: 'user not found' });
 
-    user.lastSeen = new Date();
+    user.lastSeen = Date.now();
     await user.save();
 
     const userResponse = {
@@ -388,7 +354,6 @@ app.get('/users/me', auth, async (req, res) => {
 
     res.json(userResponse);
   } catch (err) {
-    console.error('Get user error:', err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -409,7 +374,6 @@ app.get('/users', auth, async (req, res) => {
 
     res.json(others);
   } catch (err) {
-    console.error('Get users error:', err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -458,7 +422,6 @@ app.get('/users/online-status', auth, async (req, res) => {
 
     res.json(onlineStatus);
   } catch (err) {
-    console.error('Online status error:', err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -512,7 +475,6 @@ app.get('/users/chat-rooms', auth, async (req, res) => {
 
     res.json(filteredRooms);
   } catch (err) {
-    console.error('Get chat rooms error:', err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -532,7 +494,6 @@ app.get('/messages/room/:roomId', auth, async (req, res) => {
 
     res.json(messages);
   } catch (err) {
-    console.error('Get messages error:', err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -552,14 +513,13 @@ app.put('/messages/:messageId', auth, async (req, res) => {
     }
 
     message.text = text;
-    message.updatedAt = new Date();
+    message.updatedAt = Date.now();
     await message.save();
 
     io.to(message.from).to(message.to).emit('message:updated', message);
 
     res.json(message);
   } catch (err) {
-    console.error('Edit message error:', err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -582,12 +542,19 @@ app.delete('/messages/:messageId', auth, async (req, res) => {
 
     res.json({ ok: true });
   } catch (err) {
-    console.error('Delete message error:', err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// Health check endpoint (kept at root)
+app.use((error, req, res, next) => {
+  if (error instanceof multer.MulterError) {
+    if (error.code === 'LIMIT_FILE_SIZE') {
+      return res.status(400).json({ error: 'File too large (max 5MB)' });
+    }
+  }
+  res.status(500).json({ error: error.message });
+});
+
 app.get('/health', async (req, res) => {
   try {
     await mongoose.connection.db.admin().ping();
@@ -597,43 +564,22 @@ app.get('/health', async (req, res) => {
   }
 });
 
-// Error handling middleware
-app.use((error, req, res, next) => {
-  if (error instanceof multer.MulterError) {
-    if (error.code === 'LIMIT_FILE_SIZE') {
-      return res.status(400).json({ error: 'File too large (max 5MB)' });
-    }
-  }
-  console.error('Unhandled error:', error);
-  res.status(500).json({ error: 'Internal server error' });
-});
-
 // ---------------- Socket.IO ----------------
 io.use((socket, next) => {
+  let token = socket.handshake.auth?.token;
+  if (!token && socket.handshake.headers.cookie) {
+    const cookies = Object.fromEntries(socket.handshake.headers.cookie.split(';').map(c => {
+      const [k, ...v] = c.trim().split('=');
+      return [k, v.join('=')];
+    }));
+    token = cookies[COOKIE_NAME];
+  }
+  if (!token) return next(new Error('Missing token'));
   try {
-    // Try to get token from handshake auth
-    let token = socket.handshake.auth?.token;
-
-    // If not in auth, check cookies
-    if (!token && socket.handshake.headers.cookie) {
-      const cookies = socket.handshake.headers.cookie.split(';').reduce((acc, cookie) => {
-        const [key, value] = cookie.trim().split('=');
-        acc[key] = value;
-        return acc;
-      }, {});
-
-      token = cookies[COOKIE_NAME];
-    }
-
-    if (!token) {
-      return next(new Error('Authentication token required'));
-    }
-
     socket.user = jwt.verify(token, SECRET);
     next();
-  } catch (error) {
-    console.error('Socket auth error:', error.message);
-    next(new Error('Invalid authentication token'));
+  } catch {
+    next(new Error('Invalid token'));
   }
 });
 
