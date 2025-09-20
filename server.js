@@ -307,21 +307,23 @@ app.post('/login', async (req, res) => {
   }
 });
 
+// In your backend (server.js)
 app.post('/logout', auth, async (req, res) => {
   try {
     await User.findOneAndUpdate(
       { id: req.user.userId },
       { lastSeen: Date.now() }
     );
-
-    // Clear the cookie with proper cross-domain settings
-    res.clearCookie(COOKIE_NAME, {
+    
+    // PROPERLY clear the cookie with correct settings
+    res.clearCookie('token', {
       httpOnly: true,
-      secure: true, // Must be true for cross-domain
-      sameSite: 'none', // Required for cross-domain
-      domain: '.onrender.com' // Add your domain if needed
+      secure: process.env.NODE_ENV === 'production', // true in production
+      sameSite: 'none',
+      domain: process.env.NODE_ENV === 'production' ? '.onrender.com' : undefined,
+      path: '/'
     });
-
+    
     res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
