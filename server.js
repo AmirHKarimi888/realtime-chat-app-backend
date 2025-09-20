@@ -245,7 +245,8 @@ app.post('/users', upload.single('avatar'), async (req, res) => {
       password: hashedPassword,
       displayName: displayName || username,
       defaultAvatar: defaultAvatar || '',
-      avatar: avatarPath,
+      avatar: "",
+      //avatarPath,
       chatRooms: [],
       createdAt: Date.now(),
       lastSeen: Date.now()
