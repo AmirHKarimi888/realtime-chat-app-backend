@@ -14,24 +14,9 @@ const rateLimit = require('express-rate-limit');
 
 const PORT = process.env.PORT || 4000;
 const UPLOADS_DIR = path.join(__dirname, 'uploads');
-const SECRET = process.env.JWT_SECRET || 'dev-secret-change-in-production';
+const SECRET = process.env.JWT_SECRET || 'dev-secret';
 const COOKIE_NAME = 'token';
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/chat-app';
-
-// Environment detection
-const isProduction = process.env.NODE_ENV === 'production';
-const allowedOrigins = [
-  'http://localhost:5173',
-  'https://realtime-chat-app-navy-ten.vercel.app'
-];
-
-// Enhanced cookie options for mobile compatibility
-const cookieOptions = {
-  httpOnly: true,
-  secure: isProduction,
-  sameSite: isProduction ? 'none' : 'lax',
-  maxAge: 7 * 24 * 60 * 60 * 1000
-};
 
 // ---------------- MongoDB Connection ----------------
 mongoose.connect(MONGODB_URI)
@@ -55,6 +40,7 @@ const userSchema = new mongoose.Schema({
   username: { type: String, required: true, unique: true },
   password: { type: String, required: true },
   displayName: { type: String, required: true },
+  defaultAvatar: { type: String, default: '' },
   avatar: { type: String, default: '' },
   chatRooms: [{ type: String, ref: 'ChatRoom' }],
   createdAt: { type: Date, default: Date.now },
@@ -127,37 +113,22 @@ const upload = multer({
 // ---------------- Express ----------------
 const app = express();
 const server = http.createServer(app);
-
-// Enhanced CORS configuration - FIXED
-app.use((req, res, next) => {
-  const origin = req.headers.origin;
-  if (allowedOrigins.includes(origin)) {
-    res.header('Access-Control-Allow-Origin', origin);
-  }
-
-  res.header('Access-Control-Allow-Credentials', 'true');
-  res.header('Access-Control-Allow-Headers', req.headers['access-control-request-headers'] || '*');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-
-  if (req.method === 'OPTIONS') {
-    return res.status(200).end();
-  }
-
-  next();
+const io = new Server(server, {
+  cors: { origin: 'http://localhost:5173', credentials: true }
 });
 
+// Middleware
+app.use(cors({
+  origin: [
+    'http://localhost:5173',
+    'https://realtime-chat-app-navy-ten.vercel.app'
+  ],
+  credentials: true, // This is important!
+  exposedHeaders: ['set-cookie'] // May help with some browsers
+}));
 app.use(express.json());
 app.use(cookieParser());
 app.use('/uploads', express.static(UPLOADS_DIR));
-
-// Socket.IO with proper CORS
-const io = new Server(server, {
-  cors: {
-    origin: allowedOrigins,
-    credentials: true,
-    methods: ["GET", "POST"]
-  }
-});
 
 // ---------------- Utilities ----------------
 const signToken = payload => jwt.sign(payload, SECRET, { expiresIn: '7d' });
@@ -175,11 +146,15 @@ const auth = async (req, res, next) => {
 // Helper function to get or create a chat room for two users
 const getOrCreateChatRoom = async (user1Id, user2Id) => {
   try {
+    // Sort user IDs to ensure consistent room finding
     const sortedUsers = [user1Id, user2Id].sort();
+
+    // Try to find existing room
     let room = await ChatRoom.findOne({
       participants: { $all: sortedUsers, $size: 2 }
     });
 
+    // If room doesn't exist, create it
     if (!room) {
       room = new ChatRoom({
         id: uuid(),
@@ -190,6 +165,7 @@ const getOrCreateChatRoom = async (user1Id, user2Id) => {
 
       await room.save();
 
+      // Add room to both users' chatRooms
       await User.updateMany(
         { id: { $in: sortedUsers } },
         { $addToSet: { chatRooms: room.id } }
@@ -204,21 +180,22 @@ const getOrCreateChatRoom = async (user1Id, user2Id) => {
 };
 
 // ---------------- Global Variables ----------------
-const onlineUsers = new Map();
+const onlineUsers = new Map(); // userId -> socketId
 
 // ---------------- Rate Limiting ----------------
 const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 200,
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 200, // Increase from 5 to 50 requests per 15 minutes
   message: { error: 'Too many authentication attempts, please try again later' }
 });
 
 const messageLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 30,
+  windowMs: 60 * 1000, // 1 minute
+  max: 30, // limit each IP to 30 messages per minute
   message: { error: 'Too many messages, please try again later' }
 });
 
+// Apply rate limiting
 app.use('/users', authLimiter);
 app.use('/messages', messageLimiter);
 
@@ -230,6 +207,7 @@ app.post('/users', upload.single('avatar'), async (req, res) => {
     if (!username || !password)
       return res.status(400).json({ error: 'username + password required' });
 
+    // Check if username exists
     const existingUser = await User.findOne({ username });
     if (existingUser)
       return res.status(409).json({ error: 'username exists' });
@@ -249,6 +227,7 @@ app.post('/users', upload.single('avatar'), async (req, res) => {
 
       avatarPath = `users/${userId}/${filename}`;
 
+      // Clean up temp directory
       const tempDir = path.dirname(req.file.path);
       try {
         const files = await fsp.readdir(tempDir);
@@ -266,7 +245,8 @@ app.post('/users', upload.single('avatar'), async (req, res) => {
       password: hashedPassword,
       displayName: displayName || username,
       defaultAvatar: defaultAvatar || '',
-      avatar: avatarPath,
+      avatar: "",
+      //avatarPath,
       chatRooms: [],
       createdAt: Date.now(),
       lastSeen: Date.now()
@@ -275,7 +255,12 @@ app.post('/users', upload.single('avatar'), async (req, res) => {
     await user.save();
 
     const token = signToken({ userId: user.id });
-    res.cookie(COOKIE_NAME, token, cookieOptions);
+    res.cookie(COOKIE_NAME, token, {
+      httpOnly: true,
+      sameSite: 'lax',
+      secure: false,
+      maxAge: 7 * 24 * 60 * 60 * 1000
+    });
 
     res.status(201).json({
       id: user.id,
@@ -305,11 +290,17 @@ app.post('/login', async (req, res) => {
     const match = await bcrypt.compare(password, user.password);
     if (!match) return res.status(401).json({ error: 'invalid credentials' });
 
+    // Update last seen
     user.lastSeen = Date.now();
     await user.save();
 
     const token = signToken({ userId: user.id });
-    res.cookie(COOKIE_NAME, token, cookieOptions);
+    res.cookie('token', token, {
+      httpOnly: true,
+      secure: true, // REQUIRED for SameSite=None
+      sameSite: 'none', // Allows cross-site cookies
+      maxAge: 7 * 24 * 60 * 60 * 1000 // 7 days
+    });
     res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -322,8 +313,15 @@ app.post('/logout', auth, async (req, res) => {
       { id: req.user.userId },
       { lastSeen: Date.now() }
     );
-    
-    res.clearCookie(COOKIE_NAME, cookieOptions);
+
+    // Clear the cookie with proper cross-domain settings
+    res.clearCookie(COOKIE_NAME, {
+      httpOnly: true,
+      secure: true, // Must be true for cross-domain
+      sameSite: 'none', // Required for cross-domain
+      domain: '.onrender.com' // Add your domain if needed
+    });
+
     res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -335,6 +333,7 @@ app.get('/users/me', auth, async (req, res) => {
     const user = await User.findOne({ id: req.user.userId });
     if (!user) return res.status(404).json({ error: 'user not found' });
 
+    // Update last seen
     user.lastSeen = Date.now();
     await user.save();
 
@@ -379,11 +378,15 @@ app.get('/users', auth, async (req, res) => {
 app.get('/users/search', auth, async (req, res) => {
   try {
     const { q } = req.query;
+    console.log('Search query received:', q); // Add logging
+
     if (!q) {
       return res.status(400).json({ error: 'Search query must be at least 2 characters' });
     }
 
     const searchTerm = q.toLowerCase();
+    console.log('Searching for:', searchTerm); // Add logging
+
     const users = await User.find({
       id: { $ne: req.user.userId },
       $or: [
@@ -391,6 +394,8 @@ app.get('/users/search', auth, async (req, res) => {
         { displayName: { $regex: searchTerm, $options: 'i' } }
       ]
     });
+
+    console.log('Found users:', users); // Add logging
 
     const results = users.map(u => ({
       id: u.id,
@@ -402,6 +407,7 @@ app.get('/users/search', auth, async (req, res) => {
       lastSeen: u.lastSeen
     }));
 
+    console.log('Sending results:', results); // Add logging
     res.json(results);
   } catch (err) {
     console.error('Search error:', err);
@@ -424,21 +430,25 @@ app.get('/users/online-status', auth, async (req, res) => {
   }
 });
 
+// Get user's chat rooms with details
 app.get('/users/chat-rooms', auth, async (req, res) => {
   try {
     const user = await User.findOne({ id: req.user.userId });
     if (!user) return res.status(404).json({ error: 'User not found' });
 
+    // Get details for each chat room
     const roomsWithDetails = await Promise.all(
       user.chatRooms.map(async (roomId) => {
         const room = await ChatRoom.findOne({ id: roomId });
         if (!room) return null;
 
+        // Get the other participant's details
         const otherParticipantId = room.participants.find(id => id !== req.user.userId);
         const otherUser = await User.findOne({ id: otherParticipantId });
 
         if (!otherUser) return null;
 
+        // Get the last message in this room
         const lastMessage = await Message.findOne(
           { roomId, isDeleted: false },
           {},
@@ -468,6 +478,7 @@ app.get('/users/chat-rooms', auth, async (req, res) => {
       })
     );
 
+    // Filter out any null values and sort by updatedAt (most recent first)
     const filteredRooms = roomsWithDetails.filter(room => room !== null);
     filteredRooms.sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
 
@@ -477,9 +488,12 @@ app.get('/users/chat-rooms', auth, async (req, res) => {
   }
 });
 
+// Get messages for a specific chat room
 app.get('/messages/room/:roomId', auth, async (req, res) => {
   try {
     const { roomId } = req.params;
+
+    // Verify user has access to this room
     const user = await User.findOne({ id: req.user.userId });
     if (!user.chatRooms.includes(roomId)) {
       return res.status(403).json({ error: 'Access denied to this chat room' });
@@ -496,6 +510,7 @@ app.get('/messages/room/:roomId', auth, async (req, res) => {
   }
 });
 
+// Edit message endpoint
 app.put('/messages/:messageId', auth, async (req, res) => {
   try {
     const { messageId } = req.params;
@@ -506,6 +521,7 @@ app.put('/messages/:messageId', auth, async (req, res) => {
     const message = await Message.findOne({ id: messageId });
     if (!message) return res.status(404).json({ error: 'Message not found' });
 
+    // Check if user owns this message
     if (message.from !== req.user.userId) {
       return res.status(403).json({ error: 'You can only edit your own messages' });
     }
@@ -514,6 +530,7 @@ app.put('/messages/:messageId', auth, async (req, res) => {
     message.updatedAt = Date.now();
     await message.save();
 
+    // Emit real-time update to both users
     io.to(message.from).to(message.to).emit('message:updated', message);
 
     res.json(message);
@@ -522,6 +539,7 @@ app.put('/messages/:messageId', auth, async (req, res) => {
   }
 });
 
+// Delete message endpoint (soft delete)
 app.delete('/messages/:messageId', auth, async (req, res) => {
   try {
     const { messageId } = req.params;
@@ -529,13 +547,16 @@ app.delete('/messages/:messageId', auth, async (req, res) => {
     const message = await Message.findOne({ id: messageId });
     if (!message) return res.status(404).json({ error: 'Message not found' });
 
+    // Check if user owns this message
     if (message.from !== req.user.userId) {
       return res.status(403).json({ error: 'You can only delete your own messages' });
     }
 
+    // Soft delete by marking as deleted
     message.isDeleted = true;
     await message.save();
 
+    // Emit real-time deletion to both users
     io.to(message.from).to(message.to).emit('message:deleted', { id: messageId });
 
     res.json({ ok: true });
@@ -544,6 +565,7 @@ app.delete('/messages/:messageId', auth, async (req, res) => {
   }
 });
 
+// Error handling for file uploads
 app.use((error, req, res, next) => {
   if (error instanceof multer.MulterError) {
     if (error.code === 'LIMIT_FILE_SIZE') {
@@ -553,8 +575,10 @@ app.use((error, req, res, next) => {
   res.status(500).json({ error: error.message });
 });
 
+// Health check endpoint
 app.get('/health', async (req, res) => {
   try {
+    // Simple ping to check if MongoDB is connected
     await mongoose.connection.db.admin().ping();
     res.json({ status: 'OK', database: 'connected' });
   } catch (err) {
@@ -585,16 +609,21 @@ io.on('connection', async (socket) => {
   const userId = socket.user.userId;
   console.log('User connected', userId, 'Socket ID:', socket.id);
 
+  // Join user to their own room
   socket.join(userId);
+
+  // Add user to online list
   onlineUsers.set(userId, socket.id);
   console.log('Online users:', Array.from(onlineUsers.keys()));
 
   try {
+    // Update user's last seen
     await User.findOneAndUpdate(
       { id: userId },
       { lastSeen: Date.now() }
     );
 
+    // Join user to all their chat rooms
     const user = await User.findOne({ id: userId });
     if (user && user.chatRooms.length > 0) {
       user.chatRooms.forEach(roomId => {
@@ -603,8 +632,10 @@ io.on('connection', async (socket) => {
       });
     }
 
+    // Broadcast that this user came online to ALL connected clients
     io.emit('user:online', userId);
 
+    // Send current online status to the newly connected user
     const onlineStatus = {};
     onlineUsers.forEach((_, id) => {
       onlineStatus[id] = true;
@@ -615,21 +646,26 @@ io.on('connection', async (socket) => {
     console.error('Error updating user status:', err);
   }
 
+  // Add this to your Socket.IO connection handler, after the other socket events
   socket.on('chatlist:get', async () => {
     try {
+      // Get user's updated chat rooms
       const user = await User.findOne({ id: userId });
       if (!user) return;
 
+      // Get details for each chat room
       const roomsWithDetails = await Promise.all(
         user.chatRooms.map(async (roomId) => {
           const room = await ChatRoom.findOne({ id: roomId });
           if (!room) return null;
 
+          // Get the other participant's details
           const otherParticipantId = room.participants.find(id => id !== userId);
           const otherUser = await User.findOne({ id: otherParticipantId });
 
           if (!otherUser) return null;
 
+          // Get the last message in this room
           const lastMessage = await Message.findOne(
             { roomId, isDeleted: false },
             {},
@@ -659,9 +695,11 @@ io.on('connection', async (socket) => {
         })
       );
 
+      // Filter out any null values and sort by updatedAt (most recent first)
       const filteredRooms = roomsWithDetails.filter(room => room !== null);
       filteredRooms.sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
 
+      // Send updated chat list to the user
       socket.emit('chatlist:updated', filteredRooms);
     } catch (err) {
       console.error('Error fetching chat list:', err);
@@ -673,28 +711,34 @@ io.on('connection', async (socket) => {
     try {
       if (!roomId) return;
 
+      // Verify user has access to this room
       const user = await User.findOne({ id: userId });
       if (!user.chatRooms.includes(roomId)) {
         socket.emit('error', { message: 'Access denied to this chat room' });
         return;
       }
 
+      // Build query
       const query = {
         roomId,
         isDeleted: false
       };
 
+      // If "before" is provided, get messages before this timestamp
       if (before) {
         query.createdAt = { $lt: new Date(before) };
       }
 
+      // Get messages
       const messages = await Message.find(query)
         .sort({ createdAt: -1 })
         .limit(limit)
         .exec();
 
+      // Reverse to get chronological order
       const orderedMessages = messages.reverse();
 
+      // Send messages to the requesting client
       socket.emit('messages:response', {
         roomId,
         messages: orderedMessages,
@@ -722,13 +766,15 @@ io.on('connection', async (socket) => {
         return socket.emit('error', { message: 'Recipient not found' });
       }
 
+      // Get or create chat room for these two users
       const room = await getOrCreateChatRoom(userId, to);
       console.log(`Using room ${room.id} for users ${userId} and ${to}`);
 
-      socket.join(room.id);
+      // JOIN BOTH USERS TO THE ROOM
+      socket.join(room.id); // Sender joins the room
       const recipientSocket = io.sockets.sockets.get(onlineUsers.get(to));
       if (recipientSocket) {
-        recipientSocket.join(room.id);
+        recipientSocket.join(room.id); // Recipient joins the room
       }
 
       const msg = new Message({
@@ -741,17 +787,21 @@ io.on('connection', async (socket) => {
         updatedAt: Date.now()
       });
 
+      // Save the message to database
       await msg.save();
       console.log(`Message saved to database: ${msg.id}`);
 
+      // Update room's updatedAt timestamp
       await ChatRoom.findOneAndUpdate(
         { id: room.id },
         { updatedAt: Date.now() }
       );
 
+      // EMIT TO THE ROOM INSTEAD OF INDIVIDUAL USERS
       io.to(room.id).emit('message:new', msg);
       console.log(`Message emitted to room ${room.id}`);
 
+      // Notify both users to update their chat lists
       io.to(userId).emit('chatlist:refresh');
       io.to(to).emit('chatlist:refresh');
 
@@ -773,12 +823,14 @@ io.on('connection', async (socket) => {
       const message = await Message.findOne({ id: messageId });
       if (!message) return;
 
+      // Check if user owns this message
       if (message.from !== userId) return;
 
       message.text = text;
       message.updatedAt = Date.now();
       await message.save();
 
+      // Send update to both users
       io.to(message.from).to(message.to).emit('message:updated', message);
     } catch (err) {
       console.error('Error editing message:', err);
@@ -792,6 +844,7 @@ io.on('connection', async (socket) => {
       const message = await Message.findOne({ id: messageId });
       if (!message) return;
 
+      // Check if user owns this message
       if (message.from !== userId) return;
 
       if (message.isDeleted) {
@@ -799,9 +852,11 @@ io.on('connection', async (socket) => {
         return;
       }
 
+      // Soft delete
       message.isDeleted = true;
       await message.save();
 
+      // This prevents the infinite loop
       socket.to(message.from).to(message.to).emit('message:deleted', { id: messageId });
     } catch (err) {
       console.error('Error deleting message:', err);
@@ -809,23 +864,29 @@ io.on('connection', async (socket) => {
   });
 
   socket.on('typing:start', ({ to }) => {
+    // Notify the recipient that this user is typing
     socket.to(to).emit('typing:start', { from: userId });
   });
 
   socket.on('typing:stop', ({ to }) => {
+    // Notify the recipient that this user stopped typing
     socket.to(to).emit('typing:stop', { from: userId });
   });
 
   socket.on('disconnect', async () => {
     console.log('User disconnected', userId);
+
+    // Remove user from online list
     onlineUsers.delete(userId);
 
     try {
+      // Update user's last seen
       await User.findOneAndUpdate(
         { id: userId },
         { lastSeen: Date.now() }
       );
 
+      // Broadcast that this user went offline to ALL connected clients
       io.emit('user:offline', userId);
     } catch (err) {
       console.error('Error updating user status on disconnect:', err);
@@ -836,7 +897,9 @@ io.on('connection', async (socket) => {
 // ---------------- Boot ----------------
 (async () => {
   try {
+    // Create uploads directory if it doesn't exist
     await fsp.mkdir(UPLOADS_DIR, { recursive: true });
+
     server.listen(PORT, () => console.log(`✅ Chat application running on http://localhost:${PORT}`));
   } catch (err) {
     console.error('Failed to start server:', err);
