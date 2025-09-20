@@ -14,20 +14,24 @@ const rateLimit = require('express-rate-limit');
 
 const PORT = process.env.PORT || 4000;
 const UPLOADS_DIR = path.join(__dirname, 'uploads');
-const SECRET = process.env.JWT_SECRET || 'dev-secret';
-const COOKIE_NAME = 'token';
+const SECRET = process.env.JWT_SECRET || 'dev-secret-change-in-production';
+const COOKIE_NAME = 'chat_token';
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/chat-app';
 
 // Environment detection
 const isProduction = process.env.NODE_ENV === 'production';
+const FRONTEND_URL = isProduction 
+  ? 'https://realtime-chat-app-navy-ten.vercel.app' 
+  : 'http://localhost:5173';
 
-// Consistent cookie options
+// Enhanced cookie options for mobile compatibility
 const cookieOptions = {
   httpOnly: true,
-  secure: isProduction,
-  sameSite: 'none',
-  partitioned: true,
-  maxAge: 7 * 24 * 60 * 60 * 1000
+  secure: isProduction, // true in production, false in development
+  sameSite: isProduction ? 'none' : 'lax', // 'none' for cross-site in production
+  partitioned: isProduction, // Only in production
+  maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+  domain: isProduction ? '.vercel.app' : undefined // Set domain in production
 };
 
 // ---------------- MongoDB Connection ----------------
@@ -52,11 +56,17 @@ const userSchema = new mongoose.Schema({
   username: { type: String, required: true, unique: true },
   password: { type: String, required: true },
   displayName: { type: String, required: true },
-  defaultAvatar: { type: String, default: '' },
   avatar: { type: String, default: '' },
   chatRooms: [{ type: String, ref: 'ChatRoom' }],
   createdAt: { type: Date, default: Date.now },
   lastSeen: { type: Date, default: Date.now }
+}, {
+  toJSON: {
+    transform: function(doc, ret) {
+      delete ret.password;
+      return ret;
+    }
+  }
 });
 
 const chatRoomSchema = new mongoose.Schema({
@@ -107,7 +117,7 @@ const storage = multer.diskStorage({
 const upload = multer({
   storage: storage,
   limits: {
-    fileSize: 5 * 1024 * 1024,
+    fileSize: 5 * 1024 * 1024, // 5MB
   },
   fileFilter: function (req, file, cb) {
     const allowedTypes = /jpeg|jpg|png|gif|webp/;
@@ -125,39 +135,58 @@ const upload = multer({
 // ---------------- Express ----------------
 const app = express();
 const server = http.createServer(app);
+
+// Enhanced CORS configuration for mobile
 const io = new Server(server, {
-  cors: { 
-    origin: [
-      'http://localhost:5173',
-      'https://realtime-chat-app-navy-ten.vercel.app'
-    ], 
-    credentials: true 
+  cors: {
+    origin: FRONTEND_URL,
+    credentials: true,
+    methods: ["GET", "POST"],
+    allowedHeaders: ["Content-Type", "Authorization", "Cookie"]
   }
 });
 
-// Middleware
+// Enhanced middleware setup
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Credentials', 'true');
+  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization, Cookie');
+  next();
+});
+
 app.use(cors({
-  origin: [
-    'http://localhost:5173',
-    'https://realtime-chat-app-navy-ten.vercel.app'
-  ],
+  origin: FRONTEND_URL,
   credentials: true,
   exposedHeaders: ['set-cookie']
 }));
-app.use(express.json());
+
+app.use(express.json({ limit: '10mb' }));
 app.use(cookieParser());
 app.use('/uploads', express.static(UPLOADS_DIR));
 
 // ---------------- Utilities ----------------
 const signToken = payload => jwt.sign(payload, SECRET, { expiresIn: '7d' });
 const auth = async (req, res, next) => {
-  const token = req.cookies[COOKIE_NAME];
-  if (!token) return res.status(401).json({ error: 'missing token' });
   try {
+    // Try to get token from cookies first
+    let token = req.cookies[COOKIE_NAME];
+    
+    // If not in cookies, check Authorization header
+    if (!token && req.headers.authorization) {
+      const authHeader = req.headers.authorization;
+      if (authHeader.startsWith('Bearer ')) {
+        token = authHeader.substring(7);
+      }
+    }
+    
+    if (!token) {
+      return res.status(401).json({ error: 'Authentication token required' });
+    }
+    
     req.user = jwt.verify(token, SECRET);
     next();
-  } catch {
-    res.status(401).json({ error: 'invalid token' });
+  } catch (error) {
+    console.error('Auth error:', error.message);
+    res.status(401).json({ error: 'Invalid or expired token' });
   }
 };
 
@@ -173,12 +202,13 @@ const getOrCreateChatRoom = async (user1Id, user2Id) => {
       room = new ChatRoom({
         id: uuid(),
         participants: sortedUsers,
-        createdAt: Date.now(),
-        updatedAt: Date.now()
+        createdAt: new Date(),
+        updatedAt: new Date()
       });
 
       await room.save();
 
+      // Add room to both users' chatRooms array
       await User.updateMany(
         { id: { $in: sortedUsers } },
         { $addToSet: { chatRooms: room.id } }
@@ -197,56 +227,68 @@ const onlineUsers = new Map();
 
 // ---------------- Rate Limiting ----------------
 const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 200,
-  message: { error: 'Too many authentication attempts, please try again later' }
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // Limit each IP to 100 requests per windowMs
+  message: { error: 'Too many authentication attempts, please try again later' },
+  standardHeaders: true,
+  legacyHeaders: false,
 });
 
 const messageLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 30,
-  message: { error: 'Too many messages, please try again later' }
+  windowMs: 60 * 1000, // 1 minute
+  max: 60, // Limit each IP to 60 requests per minute
+  message: { error: 'Too many messages, please try again later' },
+  standardHeaders: true,
+  legacyHeaders: false,
 });
 
-app.use('/users', authLimiter);
-app.use('/messages', messageLimiter);
+app.use('/api/auth', authLimiter);
+app.use('/api/messages', messageLimiter);
 
-// ---------------- Routes ----------------
-app.post('/users', upload.single('avatar'), async (req, res) => {
+// ---------------- API Routes ----------------
+// Health check endpoint
+app.get('/api/health', async (req, res) => {
   try {
-    const { username, password, displayName, defaultAvatar } = req.body;
+    await mongoose.connection.db.admin().ping();
+    res.json({ 
+      status: 'OK', 
+      database: 'connected',
+      timestamp: new Date().toISOString()
+    });
+  } catch (err) {
+    res.status(500).json({ 
+      status: 'ERROR', 
+      database: 'disconnected', 
+      error: err.message 
+    });
+  }
+});
 
-    if (!username || !password)
-      return res.status(400).json({ error: 'username + password required' });
+// User registration
+app.post('/api/auth/register', upload.single('avatar'), async (req, res) => {
+  try {
+    const { username, password, displayName } = req.body;
+
+    if (!username || !password) {
+      return res.status(400).json({ error: 'Username and password are required' });
+    }
+
+    if (password.length < 6) {
+      return res.status(400).json({ error: 'Password must be at least 6 characters' });
+    }
 
     const existingUser = await User.findOne({ username });
-    if (existingUser)
-      return res.status(409).json({ error: 'username exists' });
+    if (existingUser) {
+      return res.status(409).json({ error: 'Username already exists' });
+    }
 
     const userId = uuid();
-    const hashedPassword = await bcrypt.hash(password, 10);
+    const hashedPassword = await bcrypt.hash(password, 12);
 
     let avatarPath = '';
-
     if (req.file) {
       const filename = path.basename(req.file.filename);
-      const userUploadDir = path.join(UPLOADS_DIR, 'users', userId);
-      await fsp.mkdir(userUploadDir, { recursive: true });
-
-      const newFilePath = path.join(userUploadDir, filename);
-      await fsp.rename(req.file.path, newFilePath);
-
       avatarPath = `users/${userId}/${filename}`;
-
-      const tempDir = path.dirname(req.file.path);
-      try {
-        const files = await fsp.readdir(tempDir);
-        if (files.length === 0) {
-          await fsp.rmdir(tempDir);
-        }
-      } catch (err) {
-        console.warn('Could not clean up temp directory:', err.message);
-      }
     }
 
     const user = new User({
@@ -254,26 +296,34 @@ app.post('/users', upload.single('avatar'), async (req, res) => {
       username,
       password: hashedPassword,
       displayName: displayName || username,
-      defaultAvatar: defaultAvatar || '',
       avatar: avatarPath,
       chatRooms: [],
-      createdAt: Date.now(),
-      lastSeen: Date.now()
+      createdAt: new Date(),
+      lastSeen: new Date()
     });
 
     await user.save();
 
     const token = signToken({ userId: user.id });
+    
+    // Set HTTP-only cookie
     res.cookie(COOKIE_NAME, token, cookieOptions);
-
+    
+    // Also return token in response for mobile clients that might not handle cookies well
     res.status(201).json({
-      id: user.id,
-      displayName: user.displayName,
-      username: user.username,
-      defaultAvatar: user.defaultAvatar,
-      avatar: user.avatar ? `/uploads/${user.avatar}` : null
+      success: true,
+      user: {
+        id: user.id,
+        username: user.username,
+        displayName: user.displayName,
+        avatar: user.avatar ? `/uploads/${user.avatar}` : null
+      },
+      token: token // Include token in response for mobile
     });
   } catch (err) {
+    console.error('Registration error:', err);
+    
+    // Clean up uploaded file if error occurred
     if (req.file) {
       try {
         await fsp.unlink(req.file.path);
@@ -281,71 +331,109 @@ app.post('/users', upload.single('avatar'), async (req, res) => {
         console.warn('Could not clean up uploaded file:', cleanupErr.message);
       }
     }
-    res.status(500).json({ error: err.message });
+    
+    res.status(500).json({ error: 'Internal server error during registration' });
   }
 });
 
-app.post('/login', async (req, res) => {
+// User login
+app.post('/api/auth/login', async (req, res) => {
   try {
     const { username, password } = req.body;
+
+    if (!username || !password) {
+      return res.status(400).json({ error: 'Username and password are required' });
+    }
+
     const user = await User.findOne({ username });
-    if (!user) return res.status(401).json({ error: 'invalid credentials' });
+    if (!user) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
 
     const match = await bcrypt.compare(password, user.password);
-    if (!match) return res.status(401).json({ error: 'invalid credentials' });
+    if (!match) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
 
-    user.lastSeen = Date.now();
+    // Update last seen
+    user.lastSeen = new Date();
     await user.save();
 
     const token = signToken({ userId: user.id });
+    
+    // Set HTTP-only cookie
     res.cookie(COOKIE_NAME, token, cookieOptions);
-    res.json({ ok: true });
+    
+    // Also return token in response
+    res.json({
+      success: true,
+      user: {
+        id: user.id,
+        username: user.username,
+        displayName: user.displayName,
+        avatar: user.avatar ? `/uploads/${user.avatar}` : null
+      },
+      token: token // Include token in response for mobile
+    });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('Login error:', err);
+    res.status(500).json({ error: 'Internal server error during login' });
   }
 });
 
-app.post('/logout', auth, async (req, res) => {
+// User logout
+app.post('/api/auth/logout', auth, async (req, res) => {
   try {
     await User.findOneAndUpdate(
       { id: req.user.userId },
-      { lastSeen: Date.now() }
+      { lastSeen: new Date() }
     );
     
-    res.clearCookie(COOKIE_NAME, cookieOptions);
-    res.json({ ok: true });
+    // Clear the cookie
+    res.clearCookie(COOKIE_NAME, {
+      httpOnly: true,
+      secure: isProduction,
+      sameSite: isProduction ? 'none' : 'lax',
+      domain: isProduction ? '.vercel.app' : undefined
+    });
+    
+    res.json({ success: true, message: 'Logged out successfully' });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('Logout error:', err);
+    res.status(500).json({ error: 'Internal server error during logout' });
   }
 });
 
-app.get('/users/me', auth, async (req, res) => {
+// Get current user
+app.get('/api/users/me', auth, async (req, res) => {
   try {
     const user = await User.findOne({ id: req.user.userId });
-    if (!user) return res.status(404).json({ error: 'user not found' });
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
 
-    user.lastSeen = Date.now();
+    // Update last seen
+    user.lastSeen = new Date();
     await user.save();
 
-    const userResponse = {
+    res.json({
       id: user.id,
       username: user.username,
       displayName: user.displayName,
-      defaultAvatar: user.defaultAvatar,
       avatar: user.avatar ? `/uploads/${user.avatar}` : null,
       chatRooms: user.chatRooms,
       createdAt: user.createdAt,
       isOnline: onlineUsers.has(user.id),
       lastSeen: user.lastSeen
-    };
-
-    res.json(userResponse);
+    });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('Get user error:', err);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-app.get('/users', auth, async (req, res) => {
+// Get all users (except current)
+app.get('/api/users', auth, async (req, res) => {
   try {
     const users = await User.find({ id: { $ne: req.user.userId } });
 
@@ -353,7 +441,6 @@ app.get('/users', auth, async (req, res) => {
       id: u.id,
       username: u.username,
       displayName: u.displayName,
-      defaultAvatar: u.defaultAvatar,
       avatar: u.avatar ? `/uploads/${u.avatar}` : null,
       isOnline: onlineUsers.has(u.id),
       lastSeen: u.lastSeen
@@ -361,14 +448,16 @@ app.get('/users', auth, async (req, res) => {
 
     res.json(others);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('Get users error:', err);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-app.get('/users/search', auth, async (req, res) => {
+// Search users
+app.get('/api/users/search', auth, async (req, res) => {
   try {
     const { q } = req.query;
-    if (!q) {
+    if (!q || q.length < 2) {
       return res.status(400).json({ error: 'Search query must be at least 2 characters' });
     }
 
@@ -385,7 +474,6 @@ app.get('/users/search', auth, async (req, res) => {
       id: u.id,
       username: u.username,
       displayName: u.displayName,
-      defaultAvatar: u.defaultAvatar,
       avatar: u.avatar ? `/uploads/${u.avatar}` : null,
       isOnline: onlineUsers.has(u.id),
       lastSeen: u.lastSeen
@@ -394,29 +482,17 @@ app.get('/users/search', auth, async (req, res) => {
     res.json(results);
   } catch (err) {
     console.error('Search error:', err);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-app.get('/users/online-status', auth, async (req, res) => {
-  try {
-    const users = await User.find({});
-    const onlineStatus = {};
-
-    users.forEach(user => {
-      onlineStatus[user.id] = onlineUsers.has(user.id);
-    });
-
-    res.json(onlineStatus);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get('/users/chat-rooms', auth, async (req, res) => {
+// Get user's chat rooms
+app.get('/api/users/chat-rooms', auth, async (req, res) => {
   try {
     const user = await User.findOne({ id: req.user.userId });
-    if (!user) return res.status(404).json({ error: 'User not found' });
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
 
     const roomsWithDetails = await Promise.all(
       user.chatRooms.map(async (roomId) => {
@@ -441,7 +517,6 @@ app.get('/users/chat-rooms', auth, async (req, res) => {
             username: otherUser.username,
             displayName: otherUser.displayName,
             avatar: otherUser.avatar ? `/uploads/${otherUser.avatar}` : null,
-            defaultAvatar: otherUser.defaultAvatar,
             isOnline: onlineUsers.has(otherUser.id),
             lastSeen: otherUser.lastSeen
           },
@@ -462,14 +537,17 @@ app.get('/users/chat-rooms', auth, async (req, res) => {
 
     res.json(filteredRooms);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('Get chat rooms error:', err);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-app.get('/messages/room/:roomId', auth, async (req, res) => {
+// Get messages for a room
+app.get('/api/messages/room/:roomId', auth, async (req, res) => {
   try {
     const { roomId } = req.params;
     const user = await User.findOne({ id: req.user.userId });
+    
     if (!user.chatRooms.includes(roomId)) {
       return res.status(403).json({ error: 'Access denied to this chat room' });
     }
@@ -481,42 +559,52 @@ app.get('/messages/room/:roomId', auth, async (req, res) => {
 
     res.json(messages);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('Get messages error:', err);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-app.put('/messages/:messageId', auth, async (req, res) => {
+// Edit a message
+app.put('/api/messages/:messageId', auth, async (req, res) => {
   try {
     const { messageId } = req.params;
     const { text } = req.body;
 
-    if (!text) return res.status(400).json({ error: 'Message text is required' });
+    if (!text) {
+      return res.status(400).json({ error: 'Message text is required' });
+    }
 
     const message = await Message.findOne({ id: messageId });
-    if (!message) return res.status(404).json({ error: 'Message not found' });
+    if (!message) {
+      return res.status(404).json({ error: 'Message not found' });
+    }
 
     if (message.from !== req.user.userId) {
       return res.status(403).json({ error: 'You can only edit your own messages' });
     }
 
     message.text = text;
-    message.updatedAt = Date.now();
+    message.updatedAt = new Date();
     await message.save();
 
     io.to(message.from).to(message.to).emit('message:updated', message);
 
     res.json(message);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('Edit message error:', err);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-app.delete('/messages/:messageId', auth, async (req, res) => {
+// Delete a message
+app.delete('/api/messages/:messageId', auth, async (req, res) => {
   try {
     const { messageId } = req.params;
 
     const message = await Message.findOne({ id: messageId });
-    if (!message) return res.status(404).json({ error: 'Message not found' });
+    if (!message) {
+      return res.status(404).json({ error: 'Message not found' });
+    }
 
     if (message.from !== req.user.userId) {
       return res.status(403).json({ error: 'You can only delete your own messages' });
@@ -527,46 +615,50 @@ app.delete('/messages/:messageId', auth, async (req, res) => {
 
     io.to(message.from).to(message.to).emit('message:deleted', { id: messageId });
 
-    res.json({ ok: true });
+    res.json({ success: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('Delete message error:', err);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
+// Error handling middleware
 app.use((error, req, res, next) => {
   if (error instanceof multer.MulterError) {
     if (error.code === 'LIMIT_FILE_SIZE') {
       return res.status(400).json({ error: 'File too large (max 5MB)' });
     }
   }
-  res.status(500).json({ error: error.message });
-});
-
-app.get('/health', async (req, res) => {
-  try {
-    await mongoose.connection.db.admin().ping();
-    res.json({ status: 'OK', database: 'connected' });
-  } catch (err) {
-    res.status(500).json({ status: 'ERROR', database: 'disconnected', error: err.message });
-  }
+  console.error('Unhandled error:', error);
+  res.status(500).json({ error: 'Internal server error' });
 });
 
 // ---------------- Socket.IO ----------------
 io.use((socket, next) => {
-  let token = socket.handshake.auth?.token;
-  if (!token && socket.handshake.headers.cookie) {
-    const cookies = Object.fromEntries(socket.handshake.headers.cookie.split(';').map(c => {
-      const [k, ...v] = c.trim().split('=');
-      return [k, v.join('=')];
-    }));
-    token = cookies[COOKIE_NAME];
-  }
-  if (!token) return next(new Error('Missing token'));
   try {
+    // Try to get token from handshake auth
+    let token = socket.handshake.auth?.token;
+    
+    // If not in auth, check cookies
+    if (!token && socket.handshake.headers.cookie) {
+      const cookies = socket.handshake.headers.cookie.split(';').reduce((acc, cookie) => {
+        const [key, value] = cookie.trim().split('=');
+        acc[key] = value;
+        return acc;
+      }, {});
+      
+      token = cookies[COOKIE_NAME];
+    }
+    
+    if (!token) {
+      return next(new Error('Authentication token required'));
+    }
+    
     socket.user = jwt.verify(token, SECRET);
     next();
-  } catch {
-    next(new Error('Invalid token'));
+  } catch (error) {
+    console.error('Socket auth error:', error.message);
+    next(new Error('Invalid authentication token'));
   }
 });
 
@@ -581,7 +673,7 @@ io.on('connection', async (socket) => {
   try {
     await User.findOneAndUpdate(
       { id: userId },
-      { lastSeen: Date.now() }
+      { lastSeen: new Date() }
     );
 
     const user = await User.findOne({ id: userId });
@@ -632,7 +724,6 @@ io.on('connection', async (socket) => {
               username: otherUser.username,
               displayName: otherUser.displayName,
               avatar: otherUser.avatar ? `/uploads/${otherUser.avatar}` : null,
-              defaultAvatar: otherUser.defaultAvatar,
               isOnline: onlineUsers.has(otherUser.id),
               lastSeen: otherUser.lastSeen
             },
@@ -699,20 +790,15 @@ io.on('connection', async (socket) => {
   socket.on('message:send', async ({ to, text }) => {
     try {
       if (!to || !text) {
-        console.log('Missing to or text parameters');
         return socket.emit('error', { message: 'Missing parameters' });
       }
 
-      console.log(`User ${userId} sending message to ${to}: ${text}`);
-
       const otherUser = await User.findOne({ id: to });
       if (!otherUser) {
-        console.log(`Recipient ${to} not found`);
         return socket.emit('error', { message: 'Recipient not found' });
       }
 
       const room = await getOrCreateChatRoom(userId, to);
-      console.log(`Using room ${room.id} for users ${userId} and ${to}`);
 
       socket.join(room.id);
       const recipientSocket = io.sockets.sockets.get(onlineUsers.get(to));
@@ -726,25 +812,21 @@ io.on('connection', async (socket) => {
         from: userId,
         to,
         text,
-        createdAt: Date.now(),
-        updatedAt: Date.now()
+        createdAt: new Date(),
+        updatedAt: new Date()
       });
 
       await msg.save();
-      console.log(`Message saved to database: ${msg.id}`);
 
       await ChatRoom.findOneAndUpdate(
         { id: room.id },
-        { updatedAt: Date.now() }
+        { updatedAt: new Date() }
       );
 
       io.to(room.id).emit('message:new', msg);
-      console.log(`Message emitted to room ${room.id}`);
 
       io.to(userId).emit('chatlist:refresh');
       io.to(to).emit('chatlist:refresh');
-
-      console.log(`Message ${msg.id} successfully processed`);
 
     } catch (err) {
       console.error('Error sending message:', err);
@@ -765,7 +847,7 @@ io.on('connection', async (socket) => {
       if (message.from !== userId) return;
 
       message.text = text;
-      message.updatedAt = Date.now();
+      message.updatedAt = new Date();
       await message.save();
 
       io.to(message.from).to(message.to).emit('message:updated', message);
@@ -782,11 +864,6 @@ io.on('connection', async (socket) => {
       if (!message) return;
 
       if (message.from !== userId) return;
-
-      if (message.isDeleted) {
-        console.log('Message already deleted, ignoring request');
-        return;
-      }
 
       message.isDeleted = true;
       await message.save();
@@ -812,7 +889,7 @@ io.on('connection', async (socket) => {
     try {
       await User.findOneAndUpdate(
         { id: userId },
-        { lastSeen: Date.now() }
+        { lastSeen: new Date() }
       );
 
       io.emit('user:offline', userId);
@@ -826,7 +903,12 @@ io.on('connection', async (socket) => {
 (async () => {
   try {
     await fsp.mkdir(UPLOADS_DIR, { recursive: true });
-    server.listen(PORT, () => console.log(`✅ Chat application running on http://localhost:${PORT}`));
+    server.listen(PORT, () => {
+      console.log(`✅ Chat application running on http://localhost:${PORT}`);
+      console.log(`📱 Frontend URL: ${FRONTEND_URL}`);
+      console.log(`🔐 Cookie name: ${COOKIE_NAME}`);
+      console.log(`🌐 Environment: ${isProduction ? 'Production' : 'Development'}`);
+    });
   } catch (err) {
     console.error('Failed to start server:', err);
     process.exit(1);
